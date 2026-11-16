@@ -662,6 +662,31 @@ IG.emStrongRAst = mkCloserScan(AST_CLOSER_TPL, '(?!~)[\\p{P}\\p{S}]', '(?!~)[\\s
 IG.emStrongRUnd = mkCloserScan(UND_CLOSER_TPL, '[\\p{P}\\p{S}]', '[\\s\\p{P}\\p{S}]', '[^\\s\\p{P}\\p{S}]');
 IG.delR = mkCloserScan(DEL_CLOSER_TPL, '[\\p{P}\\p{S}]', '[\\s\\p{P}\\p{S}]', '[^\\s\\p{P}\\p{S}]');
 
+// Sticky one-shot versions of each closer template's FIRST alternative
+// (the skip alternative: a `__...*...__`, `**..._...**` or leading
+// non-`~` run that can never hold a closer). In the original design
+// that alternative could only ever fire at the start of the scan —
+// its `^` anchor fails everywhere else — so instead of slicing the
+// source and re-running the whole scan on the copy, the closer scan
+// below runs the full `g` regex on the uncut string with
+// lastIndex = scanStart, and fires the skip alternative once, here,
+// at exactly scanStart. Same matches, no per-attempt copy of the rest
+// of the paragraph (the copy is what made long paragraphs quadratic:
+// every emphasis attempt re-flattened the remaining text).
+function mkCloserSkip(template, punct, punctSpace, notPunctSpace) {
+  const first = template.split('|')[0].replace(/^\^/, '');
+  return new RegExp(
+    first
+      .replace(/notPunctSpace/g, notPunctSpace)
+      .replace(/punctSpace/g, punctSpace)
+      .replace(/punct/g, punct),
+    'yu'
+  );
+}
+IG.emStrongSkipAst = mkCloserSkip(AST_CLOSER_TPL, '(?!~)[\\p{P}\\p{S}]', '(?!~)[\\s\\p{P}\\p{S}]', '(?:[^\\s\\p{P}\\p{S}]|~)');
+IG.emStrongSkipUnd = mkCloserSkip(UND_CLOSER_TPL, '[\\p{P}\\p{S}]', '[\\s\\p{P}\\p{S}]', '[^\\s\\p{P}\\p{S}]');
+IG.delSkip = mkCloserSkip(DEL_CLOSER_TPL, '[\\p{P}\\p{S}]', '[\\s\\p{P}\\p{S}]', '[^\\s\\p{P}\\p{S}]');
+
 /* ------------------------------------------------------------------ */
 /* emphasis masking                                                    */
 /* ------------------------------------------------------------------ */
@@ -812,10 +837,20 @@ function hideSpans(t, withLinks) {
   let pos = 0;
   let parts = null;
   let htmlDead = false;
+  // Once a search from some position finds no '`', '<' or '[' at
+  // all, no later search (from a further position) can find one
+  // either — so each is searched at most until its first miss,
+  // instead of re-scanning the rest of the string per construct.
+  let btDead = false;
+  let ltDead = false;
+  let brDead = false;
   for (;;) {
-    const bt = t.indexOf('`', pos);
-    const lt = htmlDead ? -1 : t.indexOf('<', pos);
-    const br = withLinks ? t.indexOf('[', pos) : -1;
+    let bt = -1;
+    if (!btDead) { bt = t.indexOf('`', pos); if (bt === -1) btDead = true; }
+    let lt = -1;
+    if (!htmlDead && !ltDead) { lt = t.indexOf('<', pos); if (lt === -1) ltDead = true; }
+    let br = -1;
+    if (withLinks && !brDead) { br = t.indexOf('[', pos); if (br === -1) brDead = true; }
     let next = -1;
     let kind = 0; // 1 = backtick, 2 = '<', 3 = '['
     if (bt !== -1) { next = bt; kind = 1; }
@@ -1243,6 +1278,59 @@ function buildLink(doc, m, ref, raw) {
   return out + `>${inner}</a>`;
 }
 
+// Flanking class of one code point for the emphasis / strikethrough
+// closer scan: 0 = word character (not punctuation, not whitespace),
+// 1 = punctuation or symbol, 2 = whitespace. `~` is a symbol, so it
+// counts as punctuation — except for `*` closers, whose grammar
+// excludes `~` from punctuation (it is the strikethrough delimiter).
+const FLANK_CLASS = new Uint8Array(128);
+for (let c = 9; c <= 13; c++) FLANK_CLASS[c] = 2;
+FLANK_CLASS[32] = 2;
+for (let c = 33; c <= 47; c++) FLANK_CLASS[c] = 1;
+for (let c = 58; c <= 64; c++) FLANK_CLASS[c] = 1;
+for (let c = 91; c <= 96; c++) FLANK_CLASS[c] = 1;
+for (let c = 123; c <= 126; c++) FLANK_CLASS[c] = 1;
+const RX_WS = /\s/u;
+
+// Flanking class of the code point ending at index `i` of `s`
+// (exclusive), and of the one starting at `i`. `ast` selects the `*`
+// grammar, where `~` counts as a word character. Non-ASCII code
+// points fall back to the Unicode tests.
+function flankBefore(s, i, ast) {
+  const c = s.charCodeAt(i - 1);
+  if (c < 128) return ast && c === 126 ? 0 : FLANK_CLASS[c];
+  const ch = c >= 0xDC00 && c <= 0xDFFF ? s.slice(i - 2, i) : s[i - 1];
+  return RX_WS.test(ch) ? 2 : RX_PUNCT.test(ch) ? 1 : 0;
+}
+function flankAfter(s, i, ast) {
+  const c = s.charCodeAt(i);
+  if (c < 128) return ast && c === 126 ? 0 : FLANK_CLASS[c];
+  const ch = c >= 0xD800 && c <= 0xDBFF ? s.slice(i, i + 2) : s[i];
+  return RX_WS.test(ch) ? 2 : RX_PUNCT.test(ch) ? 1 : 0;
+}
+
+// Which closer group (1-6) a delimiter run belongs to, from the
+// flanking classes of the characters before (`b`) and after (`a`) it
+// (0 word, 1 punct, 2 space, 3 end of string); 0 when the run is
+// neither open-only nor a closer here. The six groups are the
+// alternatives of the closer regexes, in order:
+//   1 before punct, after space/end — closer (if it may close)
+//   2 before word, after punct/space/end — closer (if it may close)
+//   3 before punct/space, after word — open-only
+//   4 before space, after punct — open-only
+//   5 before punct, after punct — closer
+//   6 before word, after word — closer (`*` and `~` only; `_` has none,
+//     so `both` is false for it)
+function closerGroup(b, a, both) {
+  if (b === 1 && (a === 2 || a === 3)) return 1;
+  if (b === 0 && (a === 1 || a === 2 || a === 3)) return 2;
+  if ((b === 1 || b === 2) && a === 0) return 3;
+  if (b === 2 && a === 1) return 4;
+  if (b === 1 && a === 1) return 5;
+  if (both && b === 0 && a === 0) return 6;
+  return 0;
+}
+
 function emCloserAt(doc, masked, delim) {
   const top = doc.masks[doc.masks.length - 1];
   if (top && top.text === masked) return top.em[delim];
@@ -1353,23 +1441,43 @@ function tryEmphasis(doc, src, pos, masked, prev) {
     const y = offset - l + k;
     const canClose = !!beforeRun.trim() && (!!afterPunct || (delim === '*' && !beforeIsPunct));
     if (delim !== '*' && delim !== '_') return undefined;
-    const scanRx = delim === '*' ? IG.emStrongRAst : IG.emStrongRUnd;
+    const ast = delim === '*';
     const lastCloser = emCloserAt(doc, masked, delim);
     const scanStart = offset + k;
     if (lastCloser < scanStart) return undefined;
-    const scanSrc = masked.slice(scanStart);
-    const maxIndex = lastCloser - scanStart;
-    let m2;
-    for (scanRx.lastIndex = 0; (m2 = scanRx.exec(scanSrc)) !== null && !(m2.index > maxIndex);) {
-      const g = m2[1] || m2[2] || m2[3] || m2[4] || m2[5] || m2[6];
-      if (!g) continue;
-      const b = g.length;
-      if (m2[3] || m2[4]) {
+    // Walk the delimiter runs with indexOf and classify their
+    // flanking directly, instead of running the Unicode closer regex
+    // over the whole tail on every attempt. The skip alternative
+    // still fires once at scanStart (see mkCloserSkip), then the
+    // search walks run to run; a run's "match start" is the
+    // character before it, so the raw span below uses
+    // runStart - 1 - scanStart as the relative match index.
+    const n = masked.length;
+    const dc = ast ? 42 : 95;
+    let search = scanStart;
+    const skipRx = ast ? IG.emStrongSkipAst : IG.emStrongSkipUnd;
+    skipRx.lastIndex = scanStart;
+    const sm = skipRx.exec(masked);
+    if (sm) search = scanStart + sm[0].length;
+    for (;;) {
+      const runStart = masked.indexOf(delim, search);
+      if (runStart === -1 || runStart > lastCloser) break;
+      let runEnd = runStart + 1;
+      while (runEnd < n && masked.charCodeAt(runEnd) === dc) runEnd++;
+      const b = runEnd - runStart;
+      search = runEnd;
+      // A run with no preceding character inside the scan range can
+      // never be a closer (the regex needs the character before it);
+      // it is skipped, exactly as the regex engine skips past it.
+      if (runStart === scanStart) continue;
+      const grp = closerGroup(flankBefore(masked, runStart, ast), runEnd >= n ? 3 : flankAfter(masked, runEnd, ast), ast);
+      if (!grp) continue;
+      if (grp === 3 || grp === 4) {
         // open-only delimiter: it adds to the openers still to be closed
         openLeft += b;
         continue;
-      } else if (m2[5] || m2[6] || canClose) {
-        if (sameAsPrev && (m2[5] || m2[6])) break;
+      } else if (grp === 5 || grp === 6 || canClose) {
+        if (sameAsPrev && (grp === 5 || grp === 6)) break;
         // the rule of three: a closer whose length plus the opener's
         // length is a multiple of 3 (when the opener's isn't) cannot close
         if (y % 3 && !((y + b) % 3)) {
@@ -1379,8 +1487,9 @@ function tryEmphasis(doc, src, pos, masked, prev) {
       }
       if (openLeft -= b, openLeft > 0) continue;
       const use = Math.min(b, b + openLeft + skipped);
-      const firstLen = firstCpLen(m2[0]);
-      const raw = src.slice(pos, pos + k + m2.index + firstLen + use);
+      const bc = masked.charCodeAt(runStart - 1);
+      const firstLen = bc >= 0xD800 && bc <= 0xDBFF ? 2 : 1;
+      const raw = src.slice(pos, pos + k + (runStart - 1 - scanStart) + firstLen + use);
       if (Math.min(k, use) % 2) {
         const inner = raw.slice(1, -1);
         const innerHtml = doc.plain ? doc.tokenizeInlinePlain(inner) : doc.tokenizeInline(inner);
@@ -1407,26 +1516,36 @@ function tryStrike(doc, src, pos, masked, prev) {
     while (runCount < m[0].length && m[0][runCount] === '~') runCount++;
     const runLen = runCount - 1 + (m[0].length > runCount ? 1 : 0);
     let openLeft = runLen;
-    const scanRx = IG.delR;
     const lastCloser = delCloserAt(doc, masked);
     const scanStart = pos + runLen;
     if (lastCloser < scanStart) return undefined;
-    const scanSrc = masked.slice(scanStart);
-    const maxIndex = lastCloser - scanStart;
-    let m2;
-    for (scanRx.lastIndex = 0; (m2 = scanRx.exec(scanSrc)) !== null && !(m2.index > maxIndex);) {
-      const g = m2[1] || m2[2] || m2[3] || m2[4] || m2[5] || m2[6];
-      if (!g) continue;
-      let l = g.length;
+    // Same hand-written run walk as tryEmphasis: the skip alternative
+    // fires once at scanStart, then indexOf walks run to run.
+    const n = masked.length;
+    let search = scanStart;
+    IG.delSkip.lastIndex = scanStart;
+    const sm = IG.delSkip.exec(masked);
+    if (sm) search = scanStart + sm[0].length;
+    for (;;) {
+      const runStart = masked.indexOf('~', search);
+      if (runStart === -1 || runStart > lastCloser) break;
+      let runEnd = runStart + 1;
+      while (runEnd < n && masked.charCodeAt(runEnd) === 126) runEnd++;
+      let l = runEnd - runStart;
+      search = runEnd;
       if (l !== runLen) continue;
-      if (m2[3] || m2[4]) {
+      if (runStart === scanStart) continue;
+      const grp = closerGroup(flankBefore(masked, runStart, false), runEnd >= n ? 3 : flankAfter(masked, runEnd, false), true);
+      if (!grp) continue;
+      if (grp === 3 || grp === 4) {
         openLeft += l;
         continue;
       }
       if (openLeft -= l, openLeft > 0) continue;
       l = Math.min(l, l + openLeft);
-      const firstLen = firstCpLen(m2[0]);
-      const raw = src.slice(pos, pos + runLen + m2.index + firstLen + l);
+      const bc = masked.charCodeAt(runStart - 1);
+      const firstLen = bc >= 0xD800 && bc <= 0xDBFF ? 2 : 1;
+      const raw = src.slice(pos, pos + runLen + (runStart - 1 - scanStart) + firstLen + l);
       const inner = raw.slice(runLen, -runLen);
       const innerHtml = doc.plain ? doc.tokenizeInlinePlain(inner) : doc.tokenizeInline(inner);
       return { html: doc.plain ? innerHtml : `<del>${innerHtml}</del>`, end: pos + raw.length };
@@ -1893,7 +2012,7 @@ class Parser {
           : RX_ESC_TEST.test(m0) ? (this.plain ? decodeRefs(m0) : escapeHtml(decodeRefs(m0)))
           : m0;
         pos = end;
-        if (m0.charCodeAt(m0.length - 1) !== 95) prevCh = m0.slice(-1);
+        if (m0.charCodeAt(m0.length - 1) !== 95) prevCh = m0.charAt(m0.length - 1);
         prevWasText = true;
         out += text;
         continue;
@@ -2267,13 +2386,25 @@ class Parser {
           const nl = src.indexOf('\n');
           const line = nl === -1 ? src : src.slice(0, nl);
           if (lineBreaksItem(line, maxLead, fenceRx, headingRx, htmlRx, quoteRx, bulletRx, hrRx)) break;
-          const expanded = line.includes('\t')
-            ? line.replace(RX.leadingSpaceTab, (v) => expandTabs(v, 0))
-            : line;
-          // leadingSpaces(expanded) also tells whether the line is
-          // blank: expanded holds only spaces exactly when the line
-          // holds only spaces and tabs
-          const lead = leadingSpaces(expanded);
+          // Walk the leading whitespace run once: it tells whether
+          // the line is blank, and whether a tab hides in it (only
+          // then is the run expanded — the expansion only ever
+          // touches the leading run, so a tab elsewhere needs no
+          // work, and the whole-line tab scan below is skipped).
+          let lead = 0;
+          let tabInLead = false;
+          for (; lead < line.length; lead++) {
+            const c = line.charCodeAt(lead);
+            if (c === 32) continue;
+            if (c === 9) { tabInLead = true; continue; }
+            break;
+          }
+          let expanded = line;
+          if (tabInLead) {
+            const head = expandTabs(line.slice(0, lead), 0);
+            expanded = head + line.slice(lead);
+            lead = head.length;
+          }
           const lineBlank = lead === expanded.length;
           const sliced = expanded.slice(contentIndent);
           if (lead >= contentIndent || lineBlank) {

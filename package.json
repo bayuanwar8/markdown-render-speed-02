@@ -1,3 +1,1 @@
-{
-  "type": "module"
-}
+{"description":"Fast, marked-compatible Markdown renderer — make.fun markdown-render-speed-02 entry","license":"MIT","main":"main.ts","name":"markdown-render-speed-02","type":"module","version":"1.0.0"}
